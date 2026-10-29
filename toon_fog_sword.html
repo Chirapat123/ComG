@@ -1,0 +1,374 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Toon + Fog Shader</title>
+    <style>
+      body { margin: 0; overflow: hidden; }
+    </style>
+  </head>
+
+  <body>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/EXRLoader.js"></script>
+
+    <script>
+      // =====================================================
+      //  SHADERS  (toon + wave + outline + fog)
+      // =====================================================
+
+      // ---------- Vertex shader หลัก ----------
+      // ใช้ chunk ของ three.js เพื่อให้รองรับ skeleton animation (SkinnedMesh)
+      const vertexShader = `
+        uniform float uTime;
+        uniform float uWaveAmp;
+
+        varying vec2 vUv;
+        varying vec3 vWorldNormal;
+        varying vec3 vWorldPos;
+        varying float vViewDepth;
+
+        #include <skinning_pars_vertex>
+
+        void main() {
+          vUv = uv;
+
+          #include <skinbase_vertex>
+          #include <beginnormal_vertex>
+          #include <skinnormal_vertex>
+          #include <begin_vertex>
+          #include <skinning_vertex>
+
+          vec3 pos = transformed;
+
+          // คลื่น sin (จากโค้ดแรก) - ปรับความแรงด้วย uWaveAmp
+          pos.z += sin(pos.x * 5.0 + uTime) * uWaveAmp;
+
+          vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);
+          vec4 worldPos = modelMatrix * vec4(pos, 1.0);
+          vec4 viewPos  = viewMatrix * worldPos;
+
+          vWorldPos  = worldPos.xyz;
+          vViewDepth = -viewPos.z;   // ระยะจากกล้อง ใช้คำนวณหมอก
+
+          gl_Position = projectionMatrix * viewPos;
+        }
+      `;
+
+      // ---------- Fragment shader หลัก ----------
+      const fragmentShader = `
+        uniform sampler2D uTexture;
+        uniform vec3  uColor;
+        uniform float uUseTexture;
+        uniform vec3  uLightDir;
+        uniform float uTime;
+
+        // fog
+        uniform vec3  uFogColor;
+        uniform float uFogNear;
+        uniform float uFogFar;
+        uniform float uHeightFogBase;     // ความสูงที่หมอกหนาสุด (ล่าง)
+        uniform float uHeightFogTop;      // ความสูงที่หมอกจางหมด (บน)
+        uniform float uHeightFogStrength;
+
+        varying vec2 vUv;
+        varying vec3 vWorldNormal;
+        varying vec3 vWorldPos;
+        varying float vViewDepth;
+
+        // คำนวณปริมาณหมอก 0..1
+        float computeFog() {
+          // หมอกตามระยะ
+          float distFog = smoothstep(uFogNear, uFogFar, vViewDepth);
+
+          // หมอกตามความสูง (ยิ่งต่ำยิ่งหนา) + ขยับช้า ๆ ให้ดูมีชีวิต
+          float h = (uHeightFogTop - vWorldPos.y) / (uHeightFogTop - uHeightFogBase);
+          h += sin(vWorldPos.x * 0.4 + uTime * 0.5) * 0.05;
+          float heightFog = clamp(h, 0.0, 1.0) * uHeightFogStrength;
+
+          // รวมสองแบบ
+          return 1.0 - (1.0 - distFog) * (1.0 - heightFog);
+        }
+
+        void main() {
+          vec3 color = mix(uColor, texture2D(uTexture, vUv).rgb, uUseTexture);
+
+          vec3 N = normalize(vWorldNormal);
+          vec3 L = normalize(uLightDir);
+          float diffuse = max(dot(N, L), 0.0);
+
+          // Toon shading (จากโค้ดแรก)
+          diffuse = smoothstep(0.15, 0.2, diffuse);
+          float ambient = 0.3;
+          color = color * (diffuse + ambient);
+
+          // ผสมหมอก
+          color = mix(color, uFogColor, computeFog());
+
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `;
+
+      // ---------- Outline vertex ----------
+      const outlineVertexShader = `
+        uniform float uTime;
+        uniform float uWaveAmp;
+        uniform float uOutline;
+
+        varying vec3 vWorldPos;
+        varying float vViewDepth;
+
+        #include <skinning_pars_vertex>
+
+        void main() {
+          #include <skinbase_vertex>
+          #include <beginnormal_vertex>
+          #include <skinnormal_vertex>
+          #include <begin_vertex>
+          #include <skinning_vertex>
+
+          vec3 pos = transformed;
+          pos.z += sin(pos.x * 5.0 + uTime) * uWaveAmp;   // ต้องตรงกับตัวหลัก
+          pos += normalize(objectNormal) * uOutline;       // ดันออกตาม normal
+
+          vec4 worldPos = modelMatrix * vec4(pos, 1.0);
+          vec4 viewPos  = viewMatrix * worldPos;
+
+          vWorldPos  = worldPos.xyz;
+          vViewDepth = -viewPos.z;
+
+          gl_Position = projectionMatrix * viewPos;
+        }
+      `;
+
+      // ---------- Outline fragment (ดำ แต่โดนหมอกกลืนด้วย) ----------
+      const outlineFragmentShader = `
+        uniform float uTime;
+        uniform vec3  uFogColor;
+        uniform float uFogNear;
+        uniform float uFogFar;
+        uniform float uHeightFogBase;
+        uniform float uHeightFogTop;
+        uniform float uHeightFogStrength;
+
+        varying vec3 vWorldPos;
+        varying float vViewDepth;
+
+        void main() {
+          float distFog = smoothstep(uFogNear, uFogFar, vViewDepth);
+          float h = (uHeightFogTop - vWorldPos.y) / (uHeightFogTop - uHeightFogBase);
+          h += sin(vWorldPos.x * 0.4 + uTime * 0.5) * 0.05;
+          float heightFog = clamp(h, 0.0, 1.0) * uHeightFogStrength;
+          float fog = 1.0 - (1.0 - distFog) * (1.0 - heightFog);
+
+          gl_FragColor = vec4(mix(vec3(0.0), uFogColor, fog), 1.0);
+        }
+      `;
+
+      // uniform ที่ใช้ร่วมกันทุก material (แก้ค่าที่เดียว เปลี่ยนทุก mesh)
+      const sharedUniforms = {
+        uTime: { value: 0 },
+        uWaveAmp: { value: 0.03 },
+        uOutline: { value: 0.02 },
+        uLightDir: { value: new THREE.Vector3(10, 10, 10).normalize() },
+        uFogColor: { value: new THREE.Color(0xc9b8b0) },
+        uFogNear: { value: 15 },
+        uFogFar: { value: 70 },
+        uHeightFogBase: { value: -10 },
+        uHeightFogTop: { value: -3 },
+        uHeightFogStrength: { value: 0.6 },
+      };
+
+      // =====================================================
+      //  SCENE
+      // =====================================================
+      const renderer = new THREE.WebGLRenderer();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+
+      const camera = new THREE.PerspectiveCamera(
+        75, window.innerWidth / window.innerHeight, 0.1, 1000,
+      );
+      camera.position.set(0, 2, -10);
+      camera.lookAt(0, 0, 0);
+      const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+      // พื้นหลังเป็นสีหมอก เผื่อ skybox ยังโหลดไม่เสร็จ
+      scene.background = sharedUniforms.uFogColor.value;
+
+      const exrSkyboxUrl =
+        "https://chirapat123.github.io/qwantani_dusk_2_puresky_1k.exr";
+      const pmremGenerator = new THREE.PMREMGenerator(renderer);
+      pmremGenerator.compileEquirectangularShader();
+
+      new THREE.EXRLoader().setDataType(THREE.UnsignedByteType).load(
+        exrSkyboxUrl,
+        (texture) => {
+          const skybox = pmremGenerator.fromEquirectangular(texture).texture;
+          scene.background = skybox;
+          scene.environment = skybox;
+          texture.dispose();
+          pmremGenerator.dispose();
+        },
+        undefined,
+        (error) => console.error("Unable to load EXR skybox:", error),
+      );
+
+      const clock = new THREE.Clock();
+      let mixer;
+      const loader = new THREE.GLTFLoader();
+
+      // ---------- picking / zoom ----------
+      const pickables = [];
+      const raycaster = new THREE.Raycaster();
+      const pointer = new THREE.Vector2();
+
+      const defaultCamPos = camera.position.clone();
+      const defaultTarget = controls.target.clone();
+      let goalCamPos = null;
+      let goalTarget = null;
+
+      loader.load("https://chirapat123.github.io/SwordNew.glb", (gltf) => {
+        const model = gltf.scene;
+        model.position.set(-8, -10, 30);
+        model.scale.set(3, 3, 3);
+        scene.add(model);
+
+        // เก็บ mesh ก่อน แล้วค่อยแก้ (กันการ add child ระหว่าง traverse)
+        const meshes = [];
+        model.traverse((child) => {
+          if (child.isMesh) meshes.push(child);
+        });
+
+        meshes.forEach((child) => {
+          const oldMat = child.material;
+          const map = oldMat && oldMat.map ? oldMat.map : null;
+
+          // กดได้เฉพาะ mesh ที่มี texture (ตรวจก่อนเปลี่ยน material)
+          if (map) pickables.push(child);
+
+          const isSkinned = !!child.isSkinnedMesh;
+
+          // --- material หลัก: toon + fog ---
+          child.material = new THREE.ShaderMaterial({
+            uniforms: {
+              ...sharedUniforms,
+              uTexture: { value: map },
+              uUseTexture: { value: map ? 1.0 : 0.0 },
+              uColor: { value: oldMat && oldMat.color ? oldMat.color.clone() : new THREE.Color(1, 1, 1) },
+            },
+            vertexShader,
+            fragmentShader,
+            skinning: isSkinned,
+          });
+
+          // --- outline: เรนเดอร์ด้านหลังเป็นสีดำ ---
+          const outlineMat = new THREE.ShaderMaterial({
+            uniforms: { ...sharedUniforms },
+            vertexShader: outlineVertexShader,
+            fragmentShader: outlineFragmentShader,
+            side: THREE.BackSide,
+            skinning: isSkinned,
+          });
+
+          let outlineMesh;
+          if (isSkinned) {
+            outlineMesh = new THREE.SkinnedMesh(child.geometry, outlineMat);
+            outlineMesh.bind(child.skeleton, child.bindMatrix);
+            outlineMesh.frustumCulled = false;
+          } else {
+            outlineMesh = new THREE.Mesh(child.geometry, outlineMat);
+          }
+          child.add(outlineMesh); // เป็นลูกของ mesh เดิม ตามตำแหน่งเดียวกัน
+        });
+
+        mixer = new THREE.AnimationMixer(model);
+        gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
+      });
+
+      // นับเป็น "คลิก" เฉพาะตอนที่เมาส์ไม่ได้ขยับเกิน 5px (ไม่ใช่การลากหมุนกล้อง)
+      let downX = 0, downY = 0;
+      renderer.domElement.addEventListener("pointerdown", (e) => {
+        downX = e.clientX;
+        downY = e.clientY;
+      });
+      renderer.domElement.addEventListener("click", (e) => {
+        const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+        if (moved > 5) return; // เป็นการลาก ไม่ต้อง pick
+        onPick(e);
+      });
+
+      // ผู้ใช้เริ่มจับกล้องเมื่อไหร่ ให้ยกเลิกการเลื่อนอัตโนมัติทันที
+      controls.addEventListener("start", () => {
+        goalCamPos = null;
+        goalTarget = null;
+      });
+
+      function onPick(e) {
+        const r = renderer.domElement.getBoundingClientRect();
+        pointer.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+        pointer.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(pickables, false)[0];
+
+        if (!hit) {
+          goalCamPos = defaultCamPos.clone();
+          goalTarget = defaultTarget.clone();
+          return;
+        }
+        console.log("Picked:", hit.object.name, hit.object);
+        zoomTo(hit);
+      }
+
+      function zoomTo(hit) {
+        const object = hit.object;
+        const box = new THREE.Box3().setFromObject(object);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+
+        const maxSize = Math.max(size.x, size.y, size.z);
+        const fov = THREE.MathUtils.degToRad(camera.fov);
+        const distance = (maxSize / 2 / Math.tan(fov / 2)) * 1.5;
+
+        const dir = hit.face.normal
+          .clone()
+          .transformDirection(object.matrixWorld)
+          .normalize();
+        if (dir.dot(camera.position.clone().sub(center)) < 0) dir.negate();
+
+        goalTarget = center;
+        goalCamPos = center.clone().add(dir.multiplyScalar(distance));
+      }
+
+      function animate() {
+        const delta = clock.getDelta();
+        sharedUniforms.uTime.value = clock.elapsedTime;
+        if (mixer) mixer.update(delta);
+
+        if (goalCamPos && goalTarget) {
+          camera.position.lerp(goalCamPos, 0.08);
+          controls.target.lerp(goalTarget, 0.08);
+          if (camera.position.distanceTo(goalCamPos) < 0.01) {
+            goalCamPos = null;
+            goalTarget = null;
+          }
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    </script>
+  </body>
+</html>
